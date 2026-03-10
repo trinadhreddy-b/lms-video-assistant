@@ -4,12 +4,10 @@ Scene detection and frame extraction using multiple methods
 
 import cv2
 import numpy as np
-import json
 from scenedetect import detect, ContentDetector
 from skimage.metrics import structural_similarity as ssim
-from pathlib import Path
-import subprocess
 from config import MAX_SCREENSHOTS_PER_MINUTE
+
 
 def extract_candidate_frames(video_path, temp_dir):
     """
@@ -20,23 +18,13 @@ def extract_candidate_frames(video_path, temp_dir):
     frames_dir = temp_dir / "frames"
     frames_dir.mkdir(exist_ok=True)
 
-    # Get video duration
-    duration = get_video_duration(video_path)
-
-    # Method 1: PySceneDetect
-    scene_frames = detect_scenes(video_path, frames_dir)
-
-    # Method 2: SSIM change detection
-    ssim_frames = detect_ssim_changes(video_path, frames_dir, duration)
-
-    # Method 3: Optical flow / motion detection
-    motion_frames = detect_motion(video_path, frames_dir, duration)
+    # Single OpenCV pass: SSIM + motion detection
+    ssim_frames, motion_frames = detect_changes_opencv(video_path, frames_dir)
 
     # Merge and deduplicate
-    all_frames = scene_frames + ssim_frames + motion_frames
+    all_frames = ssim_frames + motion_frames
     all_frames.sort(key=lambda x: x['timestamp_sec'])
 
-    # Remove duplicates within 2 seconds
     deduped = []
     last_ts = -10
     for frame in all_frames:
@@ -57,83 +45,103 @@ def extract_candidate_frames(video_path, temp_dir):
 
     return capped
 
+
 def detect_scenes(video_path, frames_dir):
-    """Method 1: PySceneDetect hard cuts."""
+    """Method 1: PySceneDetect hard cuts, frames saved via OpenCV."""
     scenes = detect(video_path, ContentDetector(threshold=30.0))
     frames = []
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+
     for scene in scenes:
         ts = scene[0].get_seconds()
-        frame_path = extract_frame_at_time(video_path, ts, frames_dir, f"scene_{ts:.1f}")
-        frames.append({
-            'timestamp_sec': ts,
-            'timestamp_str': seconds_to_hms(ts),
-            'frame_path': str(frame_path),
-            'trigger': 'scene_cut'
-        })
+        frame_num = int(ts * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        ret, img = cap.read()
+        if ret:
+            frame_path = frames_dir / f"scene_{ts:.1f}.png"
+            cv2.imwrite(str(frame_path), img)
+            frames.append({
+                'timestamp_sec': ts,
+                'timestamp_str': seconds_to_hms(ts),
+                'frame_path': str(frame_path),
+                'trigger': 'scene_cut'
+            })
+
+    cap.release()
     return frames
 
-def detect_ssim_changes(video_path, frames_dir, duration):
-    """Method 2: SSIM change detection every 5 seconds."""
-    frames = []
-    prev_frame = None
-    for ts in np.arange(0, duration, 5):
-        frame = extract_frame_at_time(video_path, ts, frames_dir, f"temp_{ts:.1f}")
-        if frame.exists():
-            img = cv2.imread(str(frame))
-            if prev_frame is not None:
-                similarity = ssim(prev_frame, img, multichannel=True)
+
+def detect_changes_opencv(video_path, frames_dir):
+    """
+    Methods 2 & 3 combined: single OpenCV pass, sampling every 5 seconds.
+    Detects SSIM visual changes and motion changes simultaneously.
+    """
+    ssim_frames = []
+    motion_frames = []
+
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(1, int(fps * 5))  # every 5 seconds
+
+    prev_color = None
+    prev_gray = None
+    frame_num = 0
+
+    total_steps = total_frames // step
+    step_count = 0
+    print(f"Scanning video for visual changes (0/{total_steps})...", end='\r', flush=True)
+    while frame_num < total_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        ret, img = cap.read()
+        if not ret:
+            break
+
+        ts = frame_num / fps
+        step_count += 1
+        if step_count % 50 == 0 or step_count == total_steps:
+            print(f"Scanning video for visual changes ({step_count}/{total_steps}) — {ts/60:.1f} min processed...", end='\r', flush=True)
+
+        if img is not None and img.shape[0] >= 7 and img.shape[1] >= 7:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # SSIM check
+            if prev_color is not None:
+                similarity = ssim(prev_color, img, channel_axis=-1)
                 if similarity < 0.80:
-                    frame_path = extract_frame_at_time(video_path, ts, frames_dir, f"ssim_{ts:.1f}")
-                    frames.append({
+                    frame_path = frames_dir / f"ssim_{ts:.1f}.png"
+                    cv2.imwrite(str(frame_path), img)
+                    ssim_frames.append({
                         'timestamp_sec': ts,
                         'timestamp_str': seconds_to_hms(ts),
                         'frame_path': str(frame_path),
                         'trigger': 'visual_change'
                     })
-            prev_frame = img
-        frame.unlink(missing_ok=True)  # Remove temp frame
-    return frames
 
-def detect_motion(video_path, frames_dir, duration):
-    """Method 3: Optical flow / motion detection."""
-    frames = []
-    prev_frame = None
-    for ts in np.arange(0, duration, 5):
-        frame = extract_frame_at_time(video_path, ts, frames_dir, f"temp_{ts:.1f}")
-        if frame.exists():
-            img = cv2.imread(str(frame))
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            if prev_frame is not None:
-                diff = cv2.absdiff(prev_frame, gray)
-                mean_diff = np.mean(diff)
-                if mean_diff > 25:
-                    frame_path = extract_frame_at_time(video_path, ts, frames_dir, f"motion_{ts:.1f}")
-                    frames.append({
+            # Motion check
+            if prev_gray is not None:
+                diff = cv2.absdiff(prev_gray, gray)
+                if np.mean(diff) > 25:
+                    frame_path = frames_dir / f"motion_{ts:.1f}.png"
+                    if not frame_path.exists():  # avoid duplicate write if ssim already saved
+                        cv2.imwrite(str(frame_path), img)
+                    motion_frames.append({
                         'timestamp_sec': ts,
                         'timestamp_str': seconds_to_hms(ts),
                         'frame_path': str(frame_path),
                         'trigger': 'ui_interaction'
                     })
-            prev_frame = gray
-        frame.unlink(missing_ok=True)
-    return frames
 
-def extract_frame_at_time(video_path, ts, frames_dir, prefix):
-    """Extract frame at specific timestamp."""
-    output_path = frames_dir / f"{prefix}.png"
-    cmd = [
-        'ffmpeg', '-ss', str(ts), '-i', str(video_path),
-        '-frames:v', '1', '-q:v', '2', str(output_path), '-y'
-    ]
-    subprocess.run(cmd, capture_output=True)
-    return output_path
+            prev_color = img
+            prev_gray = gray
 
-def get_video_duration(video_path):
-    """Get video duration in seconds."""
-    cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', str(video_path)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    data = json.loads(result.stdout)
-    return float(data['format']['duration'])
+        frame_num += step
+
+    cap.release()
+    return ssim_frames, motion_frames
+
+
 
 def seconds_to_hms(seconds):
     """Convert seconds to HH:MM:SS."""

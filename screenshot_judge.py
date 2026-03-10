@@ -16,11 +16,14 @@ def judge_screenshots(candidate_frames, segments):
     """
     client = Anthropic()
     approved = []
+    total = len(candidate_frames)
 
-    for i in range(0, len(candidate_frames), BATCH_SIZE):
+    for i in range(0, total, BATCH_SIZE):
         batch = candidate_frames[i:i+BATCH_SIZE]
 
-        for frame in batch:
+        for j, frame in enumerate(batch):
+            current = i + j + 1
+            print(f"AI filtering screenshots ({current}/{total}) — approved {len(approved)} so far...", end='\r', flush=True)
             try:
                 transcript_context = get_transcript_context(frame['timestamp_sec'], segments)
 
@@ -115,9 +118,10 @@ Categories: diagram | code | ui-demo | slide | terminal | summary | instructor |
                 print(f"Error judging frame {frame['frame_path']}: {e}")
                 continue
 
-        if i + BATCH_SIZE < len(candidate_frames):
+        if i + BATCH_SIZE < total:
             time.sleep(BATCH_DELAY)
 
+    print(f"AI filtering complete — {len(approved)}/{total} screenshots approved.    ")
     return approved
 
 def get_transcript_context(timestamp, segments, window=15):
