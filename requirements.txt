@@ -1,8 +1,7 @@
 playwright
 yt-dlp
-faster-whisper
-torch
-torchaudio
+groq
+python-dotenv
 opencv-python
 scenedetect[opencv]
 scikit-image

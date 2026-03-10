@@ -11,6 +11,8 @@ from pathlib import Path
 import keyring
 import tempfile
 import shutil
+from dotenv import load_dotenv
+load_dotenv()
 # from rich.console import Console
 # from rich.progress import Progress, SpinnerColumn, TextColumn
 

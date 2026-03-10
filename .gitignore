@@ -16,7 +16,7 @@ env/
 
 # Environment / secrets
 .env
-*.env
+.env.*
 *.key
 
 # Transcription output

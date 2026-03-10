@@ -1,36 +1,105 @@
 """
-Audio transcription using faster-whisper
+Audio transcription using Groq Whisper API
 """
 
-from faster_whisper import WhisperModel
-import torch
+import os
+import time
 from pathlib import Path
-import json
-from config import WHISPER_MODEL
+from groq import Groq, RateLimitError
+
+GROQ_MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB Groq limit
 
 def transcribe_audio(audio_path, language="en"):
     """
-    Transcribes audio using faster-whisper.
+    Transcribes audio using Groq's Whisper API.
 
     Returns: list of segments with word-level timestamps
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = WhisperModel(WHISPER_MODEL, device=device)
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    audio_path = Path(audio_path)
 
-    segments, info = model.transcribe(audio_path, language=language, word_timestamps=True)
+    file_size = audio_path.stat().st_size
+    if file_size > GROQ_MAX_FILE_BYTES:
+        return _transcribe_chunked(client, audio_path, language)
 
-    # Convert to the expected format
-    result_segments = []
-    for segment in segments:
-        words = [{'word': word.word, 'start': word.start, 'end': word.end} for word in segment.words] if segment.words else []
-        result_segments.append({
-            'start': segment.start,
-            'end': segment.end,
-            'text': segment.text,
-            'words': words
-        })
+    return _transcribe_file(client, audio_path, language)
 
-    return result_segments
+def _transcribe_file(client, audio_path, language):
+    """Transcribe a single file via Groq API, with rate limit retry."""
+    for _ in range(5):
+        try:
+            with open(audio_path, "rb") as f:
+                response = client.audio.transcriptions.create(
+                    file=(audio_path.name, f),
+                    model="whisper-large-v3",
+                    language=language,
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                )
+            return [
+                {
+                    'start': seg['start'],
+                    'end': seg['end'],
+                    'text': seg['text'],
+                    'words': [],
+                }
+                for seg in response.segments
+            ]
+        except RateLimitError as e:
+            wait = 70  # default wait
+            msg = str(e)
+            # Try to parse wait time from error message
+            import re
+            m = re.search(r'try again in (\d+)m(\d+)s', msg)
+            if m:
+                wait = int(m.group(1)) * 60 + int(m.group(2)) + 5
+            else:
+                m = re.search(r'try again in (\d+)s', msg)
+                if m:
+                    wait = int(m.group(1)) + 5
+            print(f"Rate limit hit, waiting {wait}s before retry...")
+            time.sleep(wait)
+    raise RuntimeError("Exceeded max retries due to rate limiting")
+
+def _transcribe_chunked(client, audio_path, language):
+    """Split audio into <25 MB chunks and transcribe each via Groq API."""
+    import subprocess
+    import tempfile
+
+    print(f"File exceeds 25 MB Groq limit, splitting into chunks...")
+    chunk_dir = Path(tempfile.mkdtemp(prefix="groq_chunks_"))
+    chunk_pattern = str(chunk_dir / "chunk_%03d.mp3")
+
+    # Split into ~10-minute chunks as mp3 (much smaller than mp4)
+    subprocess.run([
+        "ffmpeg", "-i", str(audio_path),
+        "-f", "segment", "-segment_time", "600",
+        "-vn", "-acodec", "libmp3lame", "-q:a", "4",
+        chunk_pattern
+    ], check=True, capture_output=True)
+
+    chunks = sorted(chunk_dir.glob("chunk_*.mp3"))
+    print(f"Split into {len(chunks)} chunks")
+
+    all_segments = []
+    time_offset = 0.0
+
+    for i, chunk in enumerate(chunks):
+        print(f"Transcribing chunk {i+1}/{len(chunks)}...")
+        chunk_segments = _transcribe_file(client, chunk, language)
+        for seg in chunk_segments:
+            all_segments.append({
+                'start': seg['start'] + time_offset,
+                'end': seg['end'] + time_offset,
+                'text': seg['text'],
+                'words': [],
+            })
+        if chunk_segments:
+            time_offset += chunk_segments[-1]['end']
+
+    import shutil
+    shutil.rmtree(chunk_dir, ignore_errors=True)
+    return all_segments
 
 def parse_youtube_subtitles(vtt_path):
     """

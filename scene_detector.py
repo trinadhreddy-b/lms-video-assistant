@@ -4,6 +4,7 @@ Scene detection and frame extraction using multiple methods
 
 import cv2
 import numpy as np
+import json
 from scenedetect import detect, ContentDetector
 from skimage.metrics import structural_similarity as ssim
 from pathlib import Path
