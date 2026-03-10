@@ -1,0 +1,13 @@
+playwright
+yt-dlp
+faster-whisper
+torch
+torchaudio
+opencv-python
+scenedetect[opencv]
+scikit-image
+anthropic
+python-docx
+Pillow
+numpy
+keyring
