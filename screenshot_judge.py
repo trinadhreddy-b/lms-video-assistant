@@ -86,7 +86,7 @@ Categories: diagram | code | ui-demo | slide | terminal | summary | instructor |
                                 },
                                 {
                                     "type": "text",
-                                    "value": user_prompt
+                                    "text": user_prompt
                                 }
                             ]
                         }
@@ -104,7 +104,30 @@ Categories: diagram | code | ui-demo | slide | terminal | summary | instructor |
                 except:
                     # Retry once on bad JSON
                     time.sleep(1)
-                    response = client.messages.create(...)  # Same call
+                    response = client.messages.create(
+                        model=CLAUDE_MODEL,
+                        max_tokens=300,
+                        system=system_prompt,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/png",
+                                            "data": image_data
+                                        }
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": user_prompt
+                                    }
+                                ]
+                            }
+                        ]
+                    )
                     result_text = response.content[0].text.strip()
                     try:
                         result = json.loads(result_text)
